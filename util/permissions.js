@@ -27,8 +27,7 @@ const checkIsNativeEnvironment = async () => {
 
 /**
  * Native-Aware Permission Clearance Pipeline for the Media Capture Engine.
- * Combines network polling with an OS window refocus trigger to guarantee 
- * the video stream initializes instantly once permission is granted.
+ * Direct lifecycle implementation that gracefully handles webview thread freezing.
  * 
  * @param {string} facingMode - The active camera lens target alignment context ('user'|'environment').
  * @param {Ref} messageRef - Vue reactive text string tracker reference to push UI step warnings to.
@@ -85,47 +84,29 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
           throw new Error(`Native permissions event bus rejected query with status: ${reqResponse.status}`);
         }
 
-        // --- THE FIX: LIFECYCLE REFOCUS PROMISE TRIGGER ---
-        // This forces the app to wait until the native dialog closes and the user returns to the view
-        let standardPollingActive = true;
-        
-        const nativeRefocusEventGate = new Promise((resolve) => {
+        // --- LIFECYCLE RESUMPTION INTERCEPTOR ---
+        // Instead of running loops while the webview thread is frozen by the OS, 
+        // we create a clean promise gate that resolves only when the app view regains active focus.
+        const isGranted = await new Promise((resolve) => {
           const handleWindowRefocus = async () => {
+            // Unbind immediately to avoid duplicate trigger memory leaks
             window.removeEventListener('focus', handleWindowRefocus);
-            // Modal closed! Stop standard loop ticks and do a definitive final check
-            standardPollingActive = false; 
+            document.removeEventListener('visibilitychange', handleWindowRefocus);
+            
             if (messageRef) messageRef.value = 'Processing native selection...';
-            await sleep(300); // Allow Webview container threading to resume cleanly
+            
+            // Allow the webview engine a brief moment to unfreeze network threading channels
+            await sleep(400);
+            
+            // Verify final selection state against the database matrix
             const finalCheck = await checkStatusMatrix();
             resolve(finalCheck === 'GRANTED');
           };
+
+          // Listen for both focus and visibility changes to catch the dismiss action reliably across all webview versions
           window.addEventListener('focus', handleWindowRefocus);
+          document.addEventListener('visibilitychange', handleWindowRefocus);
         });
-
-        // Background Polling Loop (acts as a backup if the Webview doesn't fire window focus)
-        const runBackgroundFallbackPolling = async () => {
-          const maxAttempts = 60;
-          let currentAttempt = 0;
-          
-          while (currentAttempt < maxAttempts && standardPollingActive) {
-            await sleep(1000); // 1-second ticks are safer for throttled backgrounds
-            currentAttempt++;
-            
-            if (!standardPollingActive) break;
-            
-            const check = await checkStatusMatrix();
-            if (check === 'GRANTED') return true;
-            if (check === 'DENIED') return false;
-          }
-          return false;
-        };
-
-        // Race both the focus listener and the background loop to catch the first success
-        if (messageRef) messageRef.value = 'Awaiting hardware clearance...';
-        const isGranted = await Promise.race([nativeRefocusEventGate, runBackgroundFallbackPolling()]);
-
-        // Clean up the window listener if the background loop won the race instead
-        window.removeEventListener('focus', () => {});
 
         if (!isGranted) {
           return { 
@@ -141,7 +122,7 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
     return { success: false, stream: null, error: 'System permission gateway communication failure.' };
   }
 
-  // 6. Native OS state layer is cleared! Initialize local hardware WebRTC media pipelines.
+  // Native OS state layer is cleared! Initialize local hardware WebRTC media pipelines.
   if (messageRef) messageRef.value = 'Connecting to hardware device webcam channels...';
   
   try {
