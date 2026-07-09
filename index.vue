@@ -81,6 +81,7 @@
 
 <script setup>
 import {ref,onBeforeUnmount,nextTick} from 'vue';
+import { requestCameraClearance } from './util/permissions.js';
 const m=ref('Camera access required'),l=ref([]),cv=ref(null),vd=ref(null),eId=ref(null),eNm=ref(''),eIn=ref(null),cam=ref(!1),face=ref('user'),showGal=ref(!1),isRec=ref(!1);
 const prvUrl=ref(''),prvType=ref('');
 let db=null,stStream=null,pressTimer=null,vRec=null,vChunks=[],isLongPress=!1;
@@ -96,34 +97,75 @@ l.value=mf.map(t=>({...t,u:''}));
 
 function sM(){localStorage.setItem('m_gal_v5',JSON.stringify(l.value.map(t=>({id:t.id,n:t.n,d:t.d,t:t.t}))));}
 
+//async function sCam() {
+//stCamStop();showGal.value=!1;m.value='Connecting to stream...';
+//try {
+//// Fallback configuration strategy: Request raw properties first to maximize hardware permission approvals
+//const constraints={video:{facingMode:face.value},audio:true};
+//stStream=await navigator.mediaDevices.getUserMedia(constraints);
+//if(vd.value){
+//vd.value.srcObject=stStream;
+//// Force immediate execution hook for mobile devices
+//vd.value.setAttribute('playsinline',true);
+//vd.value.setAttribute('muted',true);
+//await vd.value.play();
+//cam.value=!0;m.value='Camera active';
+//}
+//}catch(err){
+//m.value='Hardware fallback initiated...';
+//try{
+//// Fallback setup: Retry execution paths without requesting audio channels
+//stStream=await navigator.mediaDevices.getUserMedia({video:true});
+//if(vd.value){
+//vd.value.srcObject=stStream;
+//await vd.value.play();
+//cam.value=!0;m.value='Camera active (No audio)';
+//}
+//}catch(fallbackErr){
+//m.value='Access denied. Check browser app system settings.';
+//}
+//}
+//}
 async function sCam() {
-stCamStop();showGal.value=!1;m.value='Connecting to stream...';
-try {
-// Fallback configuration strategy: Request raw properties first to maximize hardware permission approvals
-const constraints={video:{facingMode:face.value},audio:true};
-stStream=await navigator.mediaDevices.getUserMedia(constraints);
-if(vd.value){
-vd.value.srcObject=stStream;
-// Force immediate execution hook for mobile devices
-vd.value.setAttribute('playsinline',true);
-vd.value.setAttribute('muted',true);
-await vd.value.play();
-cam.value=!0;m.value='Camera active';
-}
-}catch(err){
-m.value='Hardware fallback initiated...';
-try{
-// Fallback setup: Retry execution paths without requesting audio channels
-stStream=await navigator.mediaDevices.getUserMedia({video:true});
-if(vd.value){
-vd.value.srcObject=stStream;
-await vd.value.play();
-cam.value=!0;m.value='Camera active (No audio)';
-}
-}catch(fallbackErr){
-m.value='Access denied. Check browser app system settings.';
-}
-}
+  stCamStop();
+  showGal.value = !1;
+  m.value = 'Requesting hardware clearance...';
+
+  // 1. Evaluate explicit permission before accessing the active viewport stream
+  const hasClearance = await requestCameraClearance(true);
+  if (!hasClearance) {
+    m.value = 'Access denied. Check browser app system settings.';
+    return; // Fast-exit out of execution flow before hardware configuration blocks crash
+  }
+
+  m.value = 'Connecting to stream...';
+  try {
+    // 2. Hardware is confirmed clear; safely spin up device streams
+    const constraints = { video: { facingMode: face.value }, audio: true };
+    stStream = await navigator.mediaDevices.getUserMedia(constraints);
+    if (vd.value) {
+      vd.value.srcObject = stStream;
+      vd.value.setAttribute('playsinline', true);
+      vd.value.setAttribute('muted', true);
+      await vd.value.play();
+      cam.value = !0;
+      m.value = 'Camera active';
+    }
+  } catch (err) {
+    // 3. Handle specific stream assignment fallback cases (e.g. mic in use by another app)
+    m.value = 'Hardware fallback initiated...';
+    try {
+      stStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (vd.value) {
+        vd.value.srcObject = stStream;
+        await vd.value.play();
+        cam.value = !0;
+        m.value = 'Camera active (No audio)';
+      }
+    } catch (fallbackErr) {
+      m.value = 'Access denied. Check browser app system settings.';
+    }
+  }
 }
 
 function stCamStop(){
