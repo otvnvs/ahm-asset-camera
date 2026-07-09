@@ -27,8 +27,8 @@ const checkIsNativeEnvironment = async () => {
 
 /**
  * Native-Aware Permission Clearance Pipeline for the Media Capture Engine.
- * Coordinates system container authorization requests before validating local hardware streams.
- * Allows a seamless one-click transition from native permission grant to live streaming.
+ * Combines network polling with an OS window refocus trigger to guarantee 
+ * the video stream initializes instantly once permission is granted.
  * 
  * @param {string} facingMode - The active camera lens target alignment context ('user'|'environment').
  * @param {Ref} messageRef - Vue reactive text string tracker reference to push UI step warnings to.
@@ -38,33 +38,41 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
   const cameraPermission = 'android.permission.CAMERA';
   const payloadData = { permissions: [cameraPermission] };
 
+  // Helper inside the scope to check the database status matrix
+  const checkStatusMatrix = async () => {
+    try {
+      const response = await fetch('/api/permissions/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadData)
+      });
+      if (response.ok) {
+        const matrixData = await response.json();
+        if (matrixData.permissions_matrix && matrixData.permissions_matrix[cameraPermission] === 'GRANTED') {
+          return 'GRANTED';
+        }
+        if (matrixData.permissions_matrix && matrixData.permissions_matrix[cameraPermission] === 'DENIED') {
+          return 'DENIED';
+        }
+      }
+    } catch (e) {
+      console.warn('[WARNING] Clearance matrix check hitch:', e.message);
+    }
+    return 'PENDING';
+  };
+
   try {
-    // 1. Evaluate Native environment wrapper vs. standard cross-platform desktop browser
     const isNative = await checkIsNativeEnvironment();
     
     if (!isNative) {
       console.log('-> [CAMERA-UTILS] Running in desktop dev browser fallback mode. Bypassing native hooks.');
     } else {
-      // 2. Query system matrix to check if permission has already been verified as GRANTED
       if (messageRef) messageRef.value = 'Verifying hardware matrix permissions...';
       
-      const statusResponse = await fetch('/api/permissions/status', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadData)
-      });
+      let currentStatus = await checkStatusMatrix();
 
-      let alreadyGranted = false;
-      if (statusResponse.ok) {
-        const matrixData = await statusResponse.json();
-        if (matrixData.permissions_matrix && matrixData.permissions_matrix[cameraPermission] === 'GRANTED') {
-          console.log('-> [CAMERA-FAST-PATH] Camera permission already verified as GRANTED.');
-          alreadyGranted = true;
-        }
-      }
-
-      // 3. If missing clearance, trigger the native asynchronous permission request bus
-      if (!alreadyGranted) {
+      // If missing clearance, trigger the native asynchronous permission request bus
+      if (currentStatus !== 'GRANTED') {
         if (messageRef) messageRef.value = 'Requesting system hardware access permissions...';
         
         const reqResponse = await fetch('/api/permissions/request', {
@@ -77,44 +85,48 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
           throw new Error(`Native permissions event bus rejected query with status: ${reqResponse.status}`);
         }
 
-        // 4. Enter structured adaptive polling loop block waiting for the user to select an option
-        const maxAttempts = 120; // 60 seconds maximum timeout threshold
-        let currentAttempt = 0;
-        let isGranted = false;
+        // --- THE FIX: LIFECYCLE REFOCUS PROMISE TRIGGER ---
+        // This forces the app to wait until the native dialog closes and the user returns to the view
+        let standardPollingActive = true;
+        
+        const nativeRefocusEventGate = new Promise((resolve) => {
+          const handleWindowRefocus = async () => {
+            window.removeEventListener('focus', handleWindowRefocus);
+            // Modal closed! Stop standard loop ticks and do a definitive final check
+            standardPollingActive = false; 
+            if (messageRef) messageRef.value = 'Processing native selection...';
+            await sleep(300); // Allow Webview container threading to resume cleanly
+            const finalCheck = await checkStatusMatrix();
+            resolve(finalCheck === 'GRANTED');
+          };
+          window.addEventListener('focus', handleWindowRefocus);
+        });
 
-        while (currentAttempt < maxAttempts) {
-          await sleep(500);
-          currentAttempt++;
+        // Background Polling Loop (acts as a backup if the Webview doesn't fire window focus)
+        const runBackgroundFallbackPolling = async () => {
+          const maxAttempts = 60;
+          let currentAttempt = 0;
           
-          if (messageRef) messageRef.value = 'Awaiting hardware clearance...';
-
-          try {
-            const checkResponse = await fetch('/api/permissions/status', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payloadData)
-            });
-
-            if (checkResponse.ok) {
-              const checkData = await checkResponse.json();
-              
-              // Handle explicit approval
-              if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'GRANTED') {
-                isGranted = true;
-                break;
-              }
-              
-              // Proactive Early Exit: Stop polling immediately if the user taps "Don't Allow"
-              if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'DENIED') {
-                break;
-              }
-            }
-          } catch (pollErr) {
-            console.warn('[WARNING] Active polling tick network hitch:', pollErr.message);
+          while (currentAttempt < maxAttempts && standardPollingActive) {
+            await sleep(1000); // 1-second ticks are safer for throttled backgrounds
+            currentAttempt++;
+            
+            if (!standardPollingActive) break;
+            
+            const check = await checkStatusMatrix();
+            if (check === 'GRANTED') return true;
+            if (check === 'DENIED') return false;
           }
-        }
+          return false;
+        };
 
-        // Absolute failure exit if the user rejects the system modal or polling timeouts
+        // Race both the focus listener and the background loop to catch the first success
+        if (messageRef) messageRef.value = 'Awaiting hardware clearance...';
+        const isGranted = await Promise.race([nativeRefocusEventGate, runBackgroundFallbackPolling()]);
+
+        // Clean up the window listener if the background loop won the race instead
+        window.removeEventListener('focus', () => {});
+
         if (!isGranted) {
           return { 
             success: false, 
@@ -129,7 +141,7 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
     return { success: false, stream: null, error: 'System permission gateway communication failure.' };
   }
 
-  // 5. Native OS state layer is cleared! Initialize local hardware WebRTC media pipelines.
+  // 6. Native OS state layer is cleared! Initialize local hardware WebRTC media pipelines.
   if (messageRef) messageRef.value = 'Connecting to hardware device webcam channels...';
   
   try {
@@ -143,12 +155,10 @@ export async function requestCameraClearance(facingMode = 'user', messageRef = n
   } catch (err) {
     console.warn(`[WARNING] Primary stream allocation failed: ${err.message}`);
     
-    // Fail immediately if explicitly blocked at browser/WebView internal privacy constraints layer
     if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
       return { success: false, stream: null, error: 'Access denied. Check browser app system settings.' };
     }
     
-    // Resource busy or audio source track collision: Attempt video-only fallback allocation
     try {
       const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
       return { success: true, stream: fallbackStream, error: 'fallback_no_audio' };
