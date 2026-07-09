@@ -1,48 +1,167 @@
-// Inside ./util/permissions.js -> requestCameraClearance()
-// Locate the 'while (currentAttempt < maxAttempts)' loop block and replace it with this:
+// ./util/permissions.js
 
-const maxAttempts = 120; // 1. Increased to 60 seconds max to account for user hesitation
-let currentAttempt = 0;
-let isGranted = false;
+/**
+ * Utility helper to pause execution loop blocks asynchronously.
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-while (currentAttempt < maxAttempts) {
-  await sleep(500);
-  currentAttempt++;
-  
-  if (messageRef) messageRef.value = `Awaiting hardware clearance...`;
+/**
+ * Verifies if the browser client is running inside the application's native wrapper environment.
+ */
+const checkIsNativeEnvironment = async () => {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1200);
+    const response = await fetch('/api/app/device-status', { 
+      method: 'GET', 
+      signal: controller.signal 
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) return false;
+    const data = await response.json();
+    return data.status === 'active';
+  } catch (e) {
+    return false;
+  }
+};
+
+/**
+ * Native-Aware Permission Clearance Pipeline for the Media Capture Engine.
+ * Coordinates system container authorization requests before validating local hardware streams.
+ * Allows a seamless one-click transition from native permission grant to live streaming.
+ * 
+ * @param {string} facingMode - The active camera lens target alignment context ('user'|'environment').
+ * @param {Ref} messageRef - Vue reactive text string tracker reference to push UI step warnings to.
+ * @returns {Promise<{success: boolean, stream: MediaStream|null, error: string}>}
+ */
+export async function requestCameraClearance(facingMode = 'user', messageRef = null) {
+  const cameraPermission = 'android.permission.CAMERA';
+  const payloadData = { permissions: [cameraPermission] };
 
   try {
-    const checkResponse = await fetch('/api/permissions/status', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payloadData)
-    });
+    // 1. Evaluate Native environment wrapper vs. standard cross-platform desktop browser
+    const isNative = await checkIsNativeEnvironment();
+    
+    if (!isNative) {
+      console.log('-> [CAMERA-UTILS] Running in desktop dev browser fallback mode. Bypassing native hooks.');
+    } else {
+      // 2. Query system matrix to check if permission has already been verified as GRANTED
+      if (messageRef) messageRef.value = 'Verifying hardware matrix permissions...';
+      
+      const statusResponse = await fetch('/api/permissions/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadData)
+      });
 
-    if (checkResponse.ok) {
-      const checkData = await checkResponse.json();
-      
-      // 2. Check for explicit approval
-      if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'GRANTED') {
-        isGranted = true;
-        break;
+      let alreadyGranted = false;
+      if (statusResponse.ok) {
+        const matrixData = await statusResponse.json();
+        if (matrixData.permissions_matrix && matrixData.permissions_matrix[cameraPermission] === 'GRANTED') {
+          console.log('-> [CAMERA-FAST-PATH] Camera permission already verified as GRANTED.');
+          alreadyGranted = true;
+        }
       }
-      
-      // 3. Proactive Safe-Exit: If the user explicitly tapped "Don't Allow", 
-      // break out immediately instead of waiting for a timeout.
-      if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'DENIED') {
-        break;
+
+      // 3. If missing clearance, trigger the native asynchronous permission request bus
+      if (!alreadyGranted) {
+        if (messageRef) messageRef.value = 'Requesting system hardware access permissions...';
+        
+        const reqResponse = await fetch('/api/permissions/request', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadData)
+        });
+
+        if (reqResponse.status !== 202) {
+          throw new Error(`Native permissions event bus rejected query with status: ${reqResponse.status}`);
+        }
+
+        // 4. Enter structured adaptive polling loop block waiting for the user to select an option
+        const maxAttempts = 120; // 60 seconds maximum timeout threshold
+        let currentAttempt = 0;
+        let isGranted = false;
+
+        while (currentAttempt < maxAttempts) {
+          await sleep(500);
+          currentAttempt++;
+          
+          if (messageRef) messageRef.value = 'Awaiting hardware clearance...';
+
+          try {
+            const checkResponse = await fetch('/api/permissions/status', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payloadData)
+            });
+
+            if (checkResponse.ok) {
+              const checkData = await checkResponse.json();
+              
+              // Handle explicit approval
+              if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'GRANTED') {
+                isGranted = true;
+                break;
+              }
+              
+              // Proactive Early Exit: Stop polling immediately if the user taps "Don't Allow"
+              if (checkData.permissions_matrix && checkData.permissions_matrix[cameraPermission] === 'DENIED') {
+                break;
+              }
+            }
+          } catch (pollErr) {
+            console.warn('[WARNING] Active polling tick network hitch:', pollErr.message);
+          }
+        }
+
+        // Absolute failure exit if the user rejects the system modal or polling timeouts
+        if (!isGranted) {
+          return { 
+            success: false, 
+            stream: null, 
+            error: 'Camera Access Denied. Camera permission is required to capture media.' 
+          };
+        }
       }
     }
-  } catch (pollErr) {
-    console.warn('[WARNING] Active polling tick network hitch:', pollErr.message);
+  } catch (err) {
+    console.error('Camera allocation transaction layer collapsed:', err.message);
+    return { success: false, stream: null, error: 'System permission gateway communication failure.' };
   }
-}
 
-if (!isGranted) {
-  return { 
-    success: false, 
-    stream: null, 
-    error: 'Camera permission denied or timed out.' 
-  };
+  // 5. Native OS state layer is cleared! Initialize local hardware WebRTC media pipelines.
+  if (messageRef) messageRef.value = 'Connecting to hardware device webcam channels...';
+  
+  try {
+    const constraints = { 
+      video: { facingMode }, 
+      audio: true 
+    };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    return { success: true, stream, error: '' };
+    
+  } catch (err) {
+    console.warn(`[WARNING] Primary stream allocation failed: ${err.message}`);
+    
+    // Fail immediately if explicitly blocked at browser/WebView internal privacy constraints layer
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      return { success: false, stream: null, error: 'Access denied. Check browser app system settings.' };
+    }
+    
+    // Resource busy or audio source track collision: Attempt video-only fallback allocation
+    try {
+      const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      return { success: true, stream: fallbackStream, error: 'fallback_no_audio' };
+    } catch (fallbackErr) {
+      console.error(`Absolute media lock failed: ${fallbackErr.message}`);
+      
+      let errorMsg = 'Access denied. Check browser app system settings.';
+      if (fallbackErr.name === 'NotReadableError' || fallbackErr.message.includes('source')) {
+        errorMsg = 'Camera resource is locked by another process.';
+      }
+      
+      return { success: false, stream: null, error: errorMsg };
+    }
+  }
 }
 
