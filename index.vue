@@ -126,47 +126,90 @@ function sM(){localStorage.setItem('m_gal_v5',JSON.stringify(l.value.map(t=>({id
 //}
 //}
 //}
+//async function sCam() {
+//  stCamStop();
+//  showGal.value = !1;
+//  m.value = 'Requesting hardware clearance...';
+//
+//  // 1. Evaluate explicit permission before accessing the active viewport stream
+//  const hasClearance = await requestCameraClearance(true);
+//  if (!hasClearance) {
+//    m.value = 'Access denied. Check browser app system settings.';
+//    return; // Fast-exit out of execution flow before hardware configuration blocks crash
+//  }
+//
+//  m.value = 'Connecting to stream...';
+//  try {
+//    // 2. Hardware is confirmed clear; safely spin up device streams
+//    const constraints = { video: { facingMode: face.value }, audio: true };
+//    stStream = await navigator.mediaDevices.getUserMedia(constraints);
+//    if (vd.value) {
+//      vd.value.srcObject = stStream;
+//      vd.value.setAttribute('playsinline', true);
+//      vd.value.setAttribute('muted', true);
+//      await vd.value.play();
+//      cam.value = !0;
+//      m.value = 'Camera active';
+//    }
+//  } catch (err) {
+//    // 3. Handle specific stream assignment fallback cases (e.g. mic in use by another app)
+//    m.value = 'Hardware fallback initiated...';
+//    try {
+//      stStream = await navigator.mediaDevices.getUserMedia({ video: true });
+//      if (vd.value) {
+//        vd.value.srcObject = stStream;
+//        await vd.value.play();
+//        cam.value = !0;
+//        m.value = 'Camera active (No audio)';
+//      }
+//    } catch (fallbackErr) {
+//      m.value = 'Access denied. Check browser app system settings.';
+//    }
+//  }
+//}
+// Inside index.vue -> sCam()
 async function sCam() {
+  // Clear any dangling references completely to prevent hardware lock collisions
   stCamStop();
   showGal.value = !1;
-  m.value = 'Requesting hardware clearance...';
+  m.value = 'Initializing camera matrix...';
 
-  // 1. Evaluate explicit permission before accessing the active viewport stream
-  const hasClearance = await requestCameraClearance(true);
-  if (!hasClearance) {
-    m.value = 'Access denied. Check browser app system settings.';
-    return; // Fast-exit out of execution flow before hardware configuration blocks crash
+  // Request native OS matrix permission and wait for loop confirmation
+  const result = await requestCameraClearance(face.value, m);
+
+  if (!result.success) {
+    m.value = result.error;
+    return;
   }
 
-  m.value = 'Connecting to stream...';
-  try {
-    // 2. Hardware is confirmed clear; safely spin up device streams
-    const constraints = { video: { facingMode: face.value }, audio: true };
-    stStream = await navigator.mediaDevices.getUserMedia(constraints);
+  // Bind the approved stream immediately
+  stStream = result.stream;
+
+  // NextTick ensures Vue has finished updating the DOM layout before binding hardware sources
+  nextTick(async () => {
     if (vd.value) {
-      vd.value.srcObject = stStream;
-      vd.value.setAttribute('playsinline', true);
-      vd.value.setAttribute('muted', true);
-      await vd.value.play();
-      cam.value = !0;
-      m.value = 'Camera active';
-    }
-  } catch (err) {
-    // 3. Handle specific stream assignment fallback cases (e.g. mic in use by another app)
-    m.value = 'Hardware fallback initiated...';
-    try {
-      stStream = await navigator.mediaDevices.getUserMedia({ video: true });
-      if (vd.value) {
+      try {
         vd.value.srcObject = stStream;
+        vd.value.setAttribute('playsinline', true);
+        vd.value.setAttribute('muted', true);
+        
+        // Force execution play down the WebRTC hardware pipeline channel immediately
         await vd.value.play();
         cam.value = !0;
-        m.value = 'Camera active (No audio)';
+        
+        if (result.error === 'fallback_no_audio') {
+          m.value = 'Camera active (No audio)';
+        } else {
+          m.value = 'Camera active';
+        }
+      } catch (playErr) {
+        console.error('Video viewport play failure:', playErr);
+        m.value = 'Streaming viewport initialization failed.';
       }
-    } catch (fallbackErr) {
-      m.value = 'Access denied. Check browser app system settings.';
     }
-  }
+  });
 }
+
 
 function stCamStop(){
 if(stStream){stStream.getTracks().forEach(t=>t.stop());stStream=null;}
